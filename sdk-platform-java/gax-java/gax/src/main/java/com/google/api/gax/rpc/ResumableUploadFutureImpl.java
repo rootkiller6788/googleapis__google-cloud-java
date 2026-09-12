@@ -38,6 +38,8 @@ import com.google.api.core.ApiFutures;
 import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.resumable.ChunkUploadRequest;
 import com.google.api.gax.resumable.ChunkUploadResponse;
+import com.google.api.gax.resumable.QueryStatusRequest;
+import com.google.api.gax.resumable.QueryStatusResponse;
 import com.google.api.gax.resumable.ResumableUploadSession;
 import com.google.common.util.concurrent.MoreExecutors;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
@@ -65,6 +67,8 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
   private final ApiFuture<ResumableUploadSession> startFuture;
   private final UnaryCallable<ChunkUploadRequest, ChunkUploadResponse<ResponseT>>
       uploadChunkCallable;
+  private final UnaryCallable<QueryStatusRequest, QueryStatusResponse<ResponseT>>
+      queryStatusCallable;
   private final InputStream payload;
   private final ResumableUploadCallSettings settings;
   private final ClientContext clientContext;
@@ -75,22 +79,21 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
   @GuardedBy("lock")
   private @Nullable ApiFuture<?> inFlightFuture;
 
-  /**
-   * Creates and initiates a new resumable upload future tracking session initiation and chunk
-   * streaming.
-   *
-   * <p>The provided {@code payload} stream is managed by the returned future and will be closed
-   * automatically upon completion, failure, or cancellation.
-   */
   static <ResponseT> ResumableUploadFutureImpl<ResponseT> create(
       ApiFuture<ResumableUploadSession> startFuture,
       UnaryCallable<ChunkUploadRequest, ChunkUploadResponse<ResponseT>> uploadChunkCallable,
+      UnaryCallable<QueryStatusRequest, QueryStatusResponse<ResponseT>> queryStatusCallable,
       InputStream payload,
       ResumableUploadCallSettings settings,
       ClientContext clientContext) {
     ResumableUploadFutureImpl<ResponseT> future =
         new ResumableUploadFutureImpl<>(
-            startFuture, uploadChunkCallable, payload, settings, clientContext);
+            startFuture,
+            uploadChunkCallable,
+            queryStatusCallable,
+            payload,
+            settings,
+            clientContext);
     try {
       future.start();
     } catch (Throwable t) {
@@ -102,12 +105,15 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
   private ResumableUploadFutureImpl(
       ApiFuture<ResumableUploadSession> startFuture,
       UnaryCallable<ChunkUploadRequest, ChunkUploadResponse<ResponseT>> uploadChunkCallable,
+      UnaryCallable<QueryStatusRequest, QueryStatusResponse<ResponseT>> queryStatusCallable,
       InputStream payload,
       ResumableUploadCallSettings settings,
       ClientContext clientContext) {
     this.startFuture = checkNotNull(startFuture, "startFuture must not be null");
     this.uploadChunkCallable =
         checkNotNull(uploadChunkCallable, "uploadChunkCallable must not be null");
+    this.queryStatusCallable =
+        checkNotNull(queryStatusCallable, "queryStatusCallable must not be null");
     this.payload = checkNotNull(payload, "payload must not be null");
     this.settings = checkNotNull(settings, "settings must not be null");
     checkArgument(settings.getChunkSize() > 0, "chunkSize must be > 0");
@@ -128,6 +134,7 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
             ResumableUploadChunkCoordinator<ResponseT> coordinator =
                 new ResumableUploadChunkCoordinator<>(
                     uploadChunkCallable,
+                    queryStatusCallable,
                     uploadSessionUrl,
                     payload,
                     settings.getChunkSize(),

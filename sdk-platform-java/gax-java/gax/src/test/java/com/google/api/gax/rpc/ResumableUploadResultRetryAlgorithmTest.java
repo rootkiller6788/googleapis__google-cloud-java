@@ -29,9 +29,12 @@
  */
 package com.google.api.gax.rpc;
 
+import static com.google.api.gax.rpc.ResumableUploadCommand.QUERY;
 import static com.google.api.gax.rpc.ResumableUploadCommand.UPLOAD;
 import static com.google.common.truth.Truth.assertThat;
 
+import com.google.api.gax.resumable.ChunkUploadResponse;
+import com.google.api.gax.resumable.ResumableUploadStatus;
 import com.google.api.gax.rpc.StatusCode.Code;
 import java.io.IOException;
 import java.util.concurrent.CancellationException;
@@ -82,9 +85,38 @@ class ResumableUploadResultRetryAlgorithmTest {
   }
 
   @Test
-  void testShouldRetry_recoverableErrorReturnsFalse() {
+  void testShouldRetry_recoverableErrorIsRetryable() {
+    ApiException recoverable400 = createApiException(400, Code.INVALID_ARGUMENT);
+    ApiException recoverable409 = createApiException(409, Code.ABORTED);
     ApiException recoverable412 = createApiException(412, Code.FAILED_PRECONDITION);
-    assertThat(algorithm.shouldRetry(recoverable412, null)).isFalse();
+
+    assertThat(algorithm.shouldRetry(recoverable400, null)).isTrue();
+    assertThat(algorithm.shouldRetry(recoverable409, null)).isTrue();
+    assertThat(algorithm.shouldRetry(recoverable412, null)).isTrue();
+  }
+
+  @Test
+  void testShouldRetry_missingStatusHeaderOnChunkResponse_returnsTrueForUpload() {
+    ResumableUploadResultRetryAlgorithm<ChunkUploadResponse<String>> algorithm =
+        new ResumableUploadResultRetryAlgorithm<>(UPLOAD);
+
+    ChunkUploadResponse<String> responseWithUnknownStatus =
+        ChunkUploadResponse.create(ResumableUploadStatus.UNKNOWN, "payload");
+    assertThat(algorithm.shouldRetry(null, responseWithUnknownStatus)).isTrue();
+
+    ChunkUploadResponse<String> responseWithActiveStatus =
+        ChunkUploadResponse.create(ResumableUploadStatus.ACTIVE, "payload");
+    assertThat(algorithm.shouldRetry(null, responseWithActiveStatus)).isFalse();
+  }
+
+  @Test
+  void testShouldRetry_missingStatusHeaderOnChunkResponse_returnsFalseForQuery() {
+    ResumableUploadResultRetryAlgorithm<ChunkUploadResponse<String>> algorithm =
+        new ResumableUploadResultRetryAlgorithm<>(QUERY);
+
+    ChunkUploadResponse<String> responseWithUnknownStatus =
+        ChunkUploadResponse.create(ResumableUploadStatus.UNKNOWN, "payload");
+    assertThat(algorithm.shouldRetry(null, responseWithUnknownStatus)).isFalse();
   }
 
   @Test

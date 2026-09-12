@@ -38,10 +38,13 @@ import com.google.api.core.InternalApi;
 import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.resumable.ChunkUploadRequest;
 import com.google.api.gax.resumable.ChunkUploadResponse;
+import com.google.api.gax.resumable.QueryStatusRequest;
+import com.google.api.gax.resumable.QueryStatusResponse;
 import com.google.api.gax.resumable.ResumableUploadStatus;
 import com.google.api.gax.retrying.ExponentialRetryAlgorithm;
 import com.google.api.gax.retrying.RetryAlgorithm;
 import com.google.api.gax.retrying.RetrySettings;
+import com.google.api.gax.retrying.RetryingFuture;
 import com.google.api.gax.retrying.ScheduledRetryingExecutor;
 import com.google.common.util.concurrent.MoreExecutors;
 import java.io.IOException;
@@ -74,34 +77,31 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
 
   private final UnaryCallable<ChunkUploadRequest, ChunkUploadResponse<ResponseT>>
       uploadChunkCallable;
+  private final UnaryCallable<QueryStatusRequest, QueryStatusResponse<ResponseT>>
+      queryStatusCallable;
   private final String uploadUrl;
   private final RewindableStreamBuffer buffer;
   private final ApiCallContext callContext;
+  private final ClientContext clientContext;
   private final SettableApiFuture<ResponseT> result = SettableApiFuture.create();
   private volatile @Nullable ApiFuture<?> currentChunkFuture;
 
   ResumableUploadChunkCoordinator(
       UnaryCallable<ChunkUploadRequest, ChunkUploadResponse<ResponseT>> uploadChunkCallable,
+      UnaryCallable<QueryStatusRequest, QueryStatusResponse<ResponseT>> queryStatusCallable,
       String uploadUrl,
       InputStream payload,
       int chunkSize,
       ClientContext clientContext) {
-    checkNotNull(uploadChunkCallable, "uploadChunkCallable must not be null");
+    this.uploadChunkCallable =
+        checkNotNull(uploadChunkCallable, "uploadChunkCallable must not be null");
+    this.queryStatusCallable =
+        checkNotNull(queryStatusCallable, "queryStatusCallable must not be null");
     this.uploadUrl = checkNotNull(uploadUrl, "uploadUrl must not be null");
     checkNotNull(payload, "payload must not be null");
-    checkNotNull(clientContext, "clientContext must not be null");
+    this.clientContext = checkNotNull(clientContext, "clientContext must not be null");
     this.callContext = clientContext.getDefaultCallContext();
     this.buffer = new RewindableStreamBuffer(payload, chunkSize, uploadUrl);
-
-    RetryAlgorithm<ChunkUploadResponse<ResponseT>> retryAlgorithm =
-        new RetryAlgorithm<>(
-            new ResumableUploadResultRetryAlgorithm<>(ResumableUploadCommand.UPLOAD),
-            new ExponentialRetryAlgorithm(CHUNK_RETRY_SETTINGS, clientContext.getClock()));
-    ScheduledRetryingExecutor<ChunkUploadResponse<ResponseT>> retryingExecutor =
-        new ScheduledRetryingExecutor<>(retryAlgorithm, clientContext.getExecutor());
-    this.uploadChunkCallable =
-        new RetryingCallable<>(
-            clientContext.getDefaultCallContext(), uploadChunkCallable, retryingExecutor);
   }
 
   ApiFuture<ResponseT> start() {
@@ -132,6 +132,16 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
     }
 
     // Determine if this is the final chunk and build the chunk request.
+    ResumableUploadCommand command;
+    if (buffer.isFinal()) {
+      if (buffer.isEmpty()) {
+        command = ResumableUploadCommand.FINALIZE;
+      } else {
+        command = ResumableUploadCommand.UPLOAD_FINALIZE;
+      }
+    } else {
+      command = ResumableUploadCommand.UPLOAD;
+    }
     ChunkUploadRequest chunkRequest =
         ChunkUploadRequest.newBuilder()
             .setUploadUrl(uploadUrl)
@@ -142,46 +152,65 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
             .build();
 
     // Dispatch the chunk upload call and register the in-flight future for cancellation.
-    long chunkLength = chunkRequest.getPayloadLength();
-    boolean isFinal = chunkRequest.isFinal();
+    ChunkAttemptCallable<ResponseT> attemptCallable =
+        new ChunkAttemptCallable<>(
+            uploadChunkCallable,
+            queryStatusCallable,
+            buffer,
+            uploadUrl,
+            chunkRequest,
+            callContext,
+            command);
+
+    RetryAlgorithm<ChunkUploadResponse<ResponseT>> retryAlgorithm =
+        new RetryAlgorithm<>(
+            new ResumableUploadResultRetryAlgorithm<>(attemptCallable::getCurrentCommand),
+            new ExponentialRetryAlgorithm(CHUNK_RETRY_SETTINGS, clientContext.getClock()));
+    ScheduledRetryingExecutor<ChunkUploadResponse<ResponseT>> retryingExecutor =
+        new ScheduledRetryingExecutor<>(retryAlgorithm, clientContext.getExecutor());
+
+    RetryingFuture<ChunkUploadResponse<ResponseT>> retryingFuture =
+        retryingExecutor.createFuture(attemptCallable, callContext);
+    attemptCallable.setRetryingFuture(retryingFuture);
+    this.currentChunkFuture = retryingFuture;
+
+    ApiFutures.addCallback(
+        retryingFuture,
+        new ApiFutureCallback<ChunkUploadResponse<ResponseT>>() {
+          @Override
+          public void onSuccess(ChunkUploadResponse<ResponseT> response) {
+            if (result.isDone()) {
+              return;
+            }
+            long nextOffset = buffer.getBufferBaseOffset() + buffer.getPayloadLength();
+            if (response.getUploadStatus() == ResumableUploadStatus.FINAL) {
+              result.set(response.getResponse());
+            } else if (buffer.isFinal()) {
+              result.setException(
+                  new IllegalStateException(
+                      "Upload stream ended and final chunk was transmitted, but server returned"
+                          + " incomplete status for upload URL: "
+                          + uploadUrl));
+            } else {
+              chunkExecutor.execute(() -> transmitChunk(nextOffset));
+            }
+          }
+
+          @Override
+          public void onFailure(Throwable t) {
+            if (t instanceof CancellationException || result.isDone()) {
+              return;
+            }
+            result.setException(t);
+          }
+        },
+        MoreExecutors.directExecutor());
     try {
-      ApiFuture<ChunkUploadResponse<ResponseT>> chunkFuture =
-          uploadChunkCallable.futureCall(chunkRequest, callContext);
-      this.currentChunkFuture = chunkFuture;
-
-      ApiFutures.addCallback(
-          chunkFuture,
-          new ApiFutureCallback<ChunkUploadResponse<ResponseT>>() {
-            @Override
-            public void onSuccess(ChunkUploadResponse<ResponseT> response) {
-              if (result.isDone()) {
-                return;
-              }
-              long nextOffset = currentOffset + chunkLength;
-              if (response.getUploadStatus() == ResumableUploadStatus.FINAL) {
-                result.set(response.getResponse());
-              } else if (isFinal) {
-                result.setException(
-                    new IllegalStateException(
-                        "Upload stream ended and final chunk was transmitted, but server returned"
-                            + " incomplete status for upload URL: "
-                            + uploadUrl));
-              } else {
-                chunkExecutor.execute(() -> transmitChunk(nextOffset));
-              }
-            }
-
-            @Override
-            public void onFailure(Throwable t) {
-              if (t instanceof CancellationException || result.isDone()) {
-                return;
-              }
-              result.setException(t);
-            }
-          },
-          MoreExecutors.directExecutor());
+      attemptCallable.call();
     } catch (Throwable t) {
-      result.setException(t);
+      if (!retryingFuture.isDone()) {
+        result.setException(t);
+      }
     }
   }
 }

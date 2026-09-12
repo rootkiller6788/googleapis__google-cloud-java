@@ -29,19 +29,24 @@
  */
 package com.google.api.gax.rpc;
 
+import static com.google.api.gax.rpc.ResumableUploadErrorClassifier.Category.RECOVERABLE;
 import static com.google.api.gax.rpc.ResumableUploadErrorClassifier.Category.TRANSIENT;
 
+import com.google.api.gax.resumable.ChunkUploadResponse;
+import com.google.api.gax.resumable.ResumableUploadStatus;
 import com.google.api.gax.retrying.BasicResultRetryAlgorithm;
 import com.google.api.gax.rpc.ResumableUploadErrorClassifier.Category;
 import java.util.Objects;
+import java.util.function.Supplier;
 import org.jspecify.annotations.NullMarked;
 import org.jspecify.annotations.Nullable;
 
 /**
  * An adapter that integrates {@link ResumableUploadErrorClassifier} into GAX retrying machinery.
  *
- * <p>Only transient errors should retry with an identical request; other recoverable errors will
- * need to query the upload server to determine the appropriate next request.
+ * <p>Retries transient errors with the identical request and recoverable errors via session query
+ * and buffer realignment. Responses lacking an upload status header also enter recovery per
+ * protocol specification.
  *
  * @param <ResponseT> the response type of the upload attempt
  */
@@ -49,21 +54,30 @@ import org.jspecify.annotations.Nullable;
 final class ResumableUploadResultRetryAlgorithm<ResponseT>
     extends BasicResultRetryAlgorithm<ResponseT> {
 
-  private final ResumableUploadCommand command;
+  private final Supplier<ResumableUploadCommand> commandSupplier;
 
   ResumableUploadResultRetryAlgorithm(ResumableUploadCommand command) {
-    this.command = Objects.requireNonNull(command);
+    Objects.requireNonNull(command);
+    this.commandSupplier = () -> command;
+  }
+
+  ResumableUploadResultRetryAlgorithm(Supplier<ResumableUploadCommand> commandSupplier) {
+    this.commandSupplier = Objects.requireNonNull(commandSupplier);
   }
 
   @Override
   public boolean shouldRetry(
       @Nullable Throwable previousThrowable, @Nullable ResponseT previousResponse) {
-    // Successful commands should not retry.
-    if (previousThrowable == null) {
-      return false;
+    ResumableUploadCommand command = commandSupplier.get();
+    Category category = null;
+    if (previousThrowable != null) {
+      category = ResumableUploadErrorClassifier.classify(previousThrowable, command);
+    } else if (previousResponse instanceof ChunkUploadResponse) {
+      ChunkUploadResponse<?> chunkResponse = (ChunkUploadResponse<?>) previousResponse;
+      if (chunkResponse.getUploadStatus() == ResumableUploadStatus.UNKNOWN) {
+        category = ResumableUploadErrorClassifier.classifyMissingStatusHeader(command);
+      }
     }
-    // Transient errors are retried directly with the identical request, others are not.
-    Category category = ResumableUploadErrorClassifier.classify(previousThrowable, command);
-    return category == TRANSIENT;
+    return category == TRANSIENT || category == RECOVERABLE;
   }
 }
