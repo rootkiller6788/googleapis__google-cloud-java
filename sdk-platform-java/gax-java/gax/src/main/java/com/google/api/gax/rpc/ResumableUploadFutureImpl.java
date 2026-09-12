@@ -241,9 +241,48 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
     if (inFlight != null) {
       inFlight.cancel(true);
     }
-    progressTracker.onFailed(t, uploadSessionUrl);
-    closePayload();
-    resultFuture.setException(t);
+    Throwable augmented = augmentWithUrl(t);
+    progressTracker.onFailed(augmented, uploadSessionUrl);
+    try {
+      payload.close();
+    } catch (Throwable closeException) {
+      augmented.addSuppressed(closeException);
+    }
+    resultFuture.setException(augmented);
+  }
+
+  private Throwable augmentWithUrl(Throwable t) {
+    String url = uploadSessionUrl;
+    if (url == null || url.isEmpty()) {
+      return t;
+    }
+    String message = t.getMessage();
+    if (message != null && message.contains(url)) {
+      return t;
+    }
+    String baseMessage = message != null ? message : t.getClass().getSimpleName();
+    String augmentedMessage = baseMessage + " (upload URL: " + url + ")";
+    Throwable augmented = t;
+    if (t instanceof ApiException) {
+      ApiException apiException = (ApiException) t;
+      augmented =
+          ApiExceptionFactory.createException(
+              augmentedMessage,
+              apiException,
+              apiException.getStatusCode(),
+              apiException.isRetryable(),
+              apiException.getErrorDetails());
+    } else if (t instanceof IllegalStateException) {
+      augmented = new IllegalStateException(augmentedMessage, t);
+    } else if (t instanceof IOException) {
+      augmented = new IOException(augmentedMessage, t);
+    }
+    if (augmented != t) {
+      for (Throwable suppressed : t.getSuppressed()) {
+        augmented.addSuppressed(suppressed);
+      }
+    }
+    return augmented;
   }
 
   private void closePayload() {

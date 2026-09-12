@@ -110,7 +110,11 @@ class ResumableUploadCallableImplTest {
     callContext = FakeCallContext.createDefault();
     executor = Executors.newScheduledThreadPool(2);
     clientContext =
-        ClientContext.newBuilder().setDefaultCallContext(callContext).setExecutor(executor).build();
+        ClientContext.newBuilder()
+            .setDefaultCallContext(callContext)
+            .setExecutor(executor)
+            .setEndpoint("https://test.endpoint.com")
+            .build();
     callable = new ResumableUploadCallableImpl<>(mockClient, defaultSettings, clientContext);
   }
 
@@ -1341,6 +1345,167 @@ class ResumableUploadCallableImplTest {
     } finally {
       multiThreadedExecutor.shutdownNow();
     }
+  }
+
+  @Test
+  void testActionableErrors_startFailure_preservesOriginalExceptionWithoutEndpointSuffix() {
+    ApiException startError = createApiException(401, StatusCode.Code.UNAUTHENTICATED);
+    when(mockStartCallable.futureCall(any(), any()))
+        .thenReturn(ApiFutures.immediateFailedFuture(startError));
+
+    ResumableUploadFuture<String> future =
+        callable.futureCall("resource-path", streamOf("hello"), null);
+
+    ExecutionException ex = assertThrows(ExecutionException.class, future::get);
+    assertThat(ex.getCause()).isSameInstanceAs(startError);
+    assertThat(ex.getCause().getMessage()).doesNotContain("endpoint:");
+    assertThat(future.getUploadSessionUrl()).isNull();
+  }
+
+  @Test
+  void testActionableErrors_chunkFailure_messageContainsUploadSessionUrl() {
+    String sessionUrl = "https://upload.url/chunk-error-test";
+    stubStartSession(sessionUrl);
+    when(mockChunkCallable.futureCall(any(ChunkUploadRequest.class), any()))
+        .thenReturn(
+            ApiFutures.immediateFailedFuture(
+                createApiException(403, StatusCode.Code.PERMISSION_DENIED)));
+
+    ResumableUploadFuture<String> future =
+        callable.futureCall("resource-path", streamOf("hello"), null);
+
+    ExecutionException ex = assertThrows(ExecutionException.class, future::get);
+    assertThat(ex.getCause()).isInstanceOf(ApiException.class);
+    assertThat(ex.getCause().getMessage()).contains(sessionUrl);
+    assertThat(future.getUploadSessionUrl()).isEqualTo(sessionUrl);
+  }
+
+  @Test
+  void testActionableErrors_preservesErrorDetailsCauseChainAndSuppressedExceptions() {
+    String sessionUrl = "https://upload.url/chunk-error-details-test";
+    stubStartSession(sessionUrl);
+    ErrorDetails errorDetails = ErrorDetails.builder().build();
+    ApiException original =
+        ApiExceptionFactory.createException(
+            "HTTP 403",
+            null,
+            new HttpStatusStatusCode(403, StatusCode.Code.PERMISSION_DENIED),
+            false,
+            errorDetails);
+    IOException suppressed = new IOException("underlying stream error");
+    original.addSuppressed(suppressed);
+    when(mockChunkCallable.futureCall(any(ChunkUploadRequest.class), any()))
+        .thenReturn(ApiFutures.immediateFailedFuture(original));
+
+    ResumableUploadFuture<String> future =
+        callable.futureCall("resource-path", streamOf("hello"), null);
+
+    ExecutionException ex = assertThrows(ExecutionException.class, future::get);
+    assertThat(ex.getCause()).isInstanceOf(ApiException.class);
+    ApiException cause = (ApiException) ex.getCause();
+    assertThat(cause.getMessage()).contains(sessionUrl);
+    assertThat(cause.getCause()).isSameInstanceAs(original);
+    assertThat(cause.getErrorDetails()).isSameInstanceAs(errorDetails);
+    assertThat(cause.getSuppressed()).asList().contains(suppressed);
+    assertThat(future.getUploadSessionUrl()).isEqualTo(sessionUrl);
+  }
+
+  @Test
+  void testActionableErrors_recoveryFailure_messageContainsUploadSessionUrl() {
+    String sessionUrl = "https://upload.url/recovery-error-test";
+    stubStartSession(sessionUrl);
+    when(mockChunkCallable.futureCall(any(ChunkUploadRequest.class), any()))
+        .thenReturn(
+            ApiFutures.immediateFailedFuture(
+                createApiException(400, StatusCode.Code.INVALID_ARGUMENT)));
+    when(mockQueryCallable.futureCall(any(QueryStatusRequest.class), any()))
+        .thenReturn(
+            ApiFutures.immediateFailedFuture(
+                createApiException(403, StatusCode.Code.PERMISSION_DENIED)));
+
+    ResumableUploadFuture<String> future =
+        callable.futureCall("resource-path", streamOf("hello"), null);
+
+    ExecutionException ex = assertThrows(ExecutionException.class, future::get);
+    assertThat(ex.getCause()).isInstanceOf(ApiException.class);
+    assertThat(ex.getCause().getMessage()).contains(sessionUrl);
+    assertThat(future.getUploadSessionUrl()).isEqualTo(sessionUrl);
+  }
+
+  @Test
+  void testActionableErrors_globalTimeoutFailure_messageContainsUploadSessionUrl() {
+    String sessionUrl = "https://upload.url/timeout-error-test";
+    stubStartSession(sessionUrl);
+    SettableApiFuture<ChunkUploadResponse<String>> hungChunk = SettableApiFuture.create();
+    when(mockChunkCallable.futureCall(any(ChunkUploadRequest.class), any())).thenReturn(hungChunk);
+
+    ResumableUploadCallSettings settings =
+        defaultSettings.toBuilder().setGlobalTimeout(Duration.ofMillis(50)).build();
+
+    ResumableUploadFuture<String> future =
+        callable.futureCall("resource-path", streamOf("hello"), null, settings);
+
+    ExecutionException ex = assertThrows(ExecutionException.class, future::get);
+    assertThat(ex.getCause()).isInstanceOf(DeadlineExceededException.class);
+    assertThat(ex.getCause().getMessage()).contains(sessionUrl);
+    assertThat(future.getUploadSessionUrl()).isEqualTo(sessionUrl);
+  }
+
+  @Test
+  void testActionableErrors_rewindFailure_surfacesActionableSeekableStreamMessage() {
+    String sessionUrl = "https://upload.url/rewind-error-test";
+    stubStartSession(sessionUrl);
+    when(mockChunkCallable.futureCall(any(ChunkUploadRequest.class), any()))
+        .thenReturn(
+            ApiFutures.immediateFuture(
+                ChunkUploadResponse.create(ResumableUploadStatus.ACTIVE, null)))
+        .thenReturn(
+            ApiFutures.immediateFailedFuture(
+                createApiException(400, StatusCode.Code.INVALID_ARGUMENT)));
+
+    when(mockQueryCallable.futureCall(any(QueryStatusRequest.class), any()))
+        .thenReturn(
+            ApiFutures.immediateFuture(
+                createQueryResponse(false, 4L, null, ResumableUploadStatus.ACTIVE)));
+
+    byte[] data = new byte[16];
+    ResumableUploadFuture<String> future =
+        callable.futureCall("resource-path", new ByteArrayInputStream(data), null);
+
+    ExecutionException ex = assertThrows(ExecutionException.class, future::get);
+    assertThat(ex.getCause()).isInstanceOf(FailedPreconditionException.class);
+    assertThat(ex.getCause().getMessage()).contains(sessionUrl);
+    assertThat(ex.getCause().getMessage()).contains("seekable stream");
+    assertThat(future.getUploadSessionUrl()).isEqualTo(sessionUrl);
+  }
+
+  @Test
+  void testUploadCallable_failureOutcome_attachesCloseExceptionViaAddSuppressed() {
+    when(mockStartCallable.futureCall(any(), any()))
+        .thenReturn(ApiFutures.immediateFailedFuture(new IllegalStateException("upload failed")));
+
+    InputStream failingStream =
+        new InputStream() {
+          @Override
+          public int read() {
+            return -1;
+          }
+
+          @Override
+          public void close() throws IOException {
+            throw new IOException("stream close error");
+          }
+        };
+
+    ResumableUploadFuture<String> future =
+        callable.futureCall("resource-path", failingStream, null);
+    ExecutionException exception = assertThrows(ExecutionException.class, future::get);
+    assertThat(exception.getCause()).isInstanceOf(IllegalStateException.class);
+    assertThat(exception.getCause().getSuppressed()).asList().hasSize(1);
+    assertThat(exception.getCause().getSuppressed()[0]).isInstanceOf(IOException.class);
+    assertThat(exception.getCause().getSuppressed()[0])
+        .hasMessageThat()
+        .contains("stream close error");
   }
 
   private static class HttpStatusStatusCode implements StatusCode {
