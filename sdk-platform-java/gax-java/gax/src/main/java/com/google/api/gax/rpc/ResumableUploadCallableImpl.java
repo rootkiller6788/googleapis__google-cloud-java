@@ -87,11 +87,7 @@ public class ResumableUploadCallableImpl<RequestT, ResponseT>
     }
 
     return ResumableUploadFutureImpl.create(
-        startFuture,
-        client.uploadChunkCallable(),
-        payload,
-        effectiveSettings,
-        clientContext.getDefaultCallContext());
+        startFuture, client.uploadChunkCallable(), payload, effectiveSettings, clientContext);
   }
 
   @Override
