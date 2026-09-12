@@ -64,6 +64,8 @@ import org.jspecify.annotations.Nullable;
 @NullMarked
 final class ResumableUploadChunkCoordinator<ResponseT> {
 
+  // Per GAX-R7: local and per-attempt deadlines are derived from the global timeout at chunk
+  // dispatch time; only backoff delay parameters are static.
   private static final RetrySettings CHUNK_RETRY_SETTINGS =
       RetrySettings.newBuilder()
           .setInitialRetryDelayDuration(Duration.ofMillis(100))
@@ -81,6 +83,8 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
       queryStatusCallable;
   private final String uploadUrl;
   private final RewindableStreamBuffer buffer;
+  private final ResumableUploadCallSettings settings;
+  private final long deadlineNanos;
   private final ApiCallContext callContext;
   private final ClientContext clientContext;
   private final SettableApiFuture<ResponseT> result = SettableApiFuture.create();
@@ -91,7 +95,8 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
       UnaryCallable<QueryStatusRequest, QueryStatusResponse<ResponseT>> queryStatusCallable,
       String uploadUrl,
       InputStream payload,
-      int chunkSize,
+      ResumableUploadCallSettings settings,
+      long deadlineNanos,
       ClientContext clientContext) {
     this.uploadChunkCallable =
         checkNotNull(uploadChunkCallable, "uploadChunkCallable must not be null");
@@ -99,9 +104,11 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
         checkNotNull(queryStatusCallable, "queryStatusCallable must not be null");
     this.uploadUrl = checkNotNull(uploadUrl, "uploadUrl must not be null");
     checkNotNull(payload, "payload must not be null");
+    this.settings = checkNotNull(settings, "settings must not be null");
+    this.deadlineNanos = deadlineNanos;
     this.clientContext = checkNotNull(clientContext, "clientContext must not be null");
     this.callContext = clientContext.getDefaultCallContext();
-    this.buffer = new RewindableStreamBuffer(payload, chunkSize, uploadUrl);
+    this.buffer = new RewindableStreamBuffer(payload, settings.getChunkSize(), uploadUrl);
   }
 
   ApiFuture<ResponseT> start() {
@@ -152,6 +159,20 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
             .build();
 
     // Dispatch the chunk upload call and register the in-flight future for cancellation.
+    // Per GAX-R7: data-plane chunk commands use half of the original global timeout as both
+    // the local and per-attempt deadline, trimmed to the remaining global deadline.
+    long remainingNanos = Math.max(1L, deadlineNanos - clientContext.getClock().nanoTime());
+    long halfGlobalNanos = settings.getGlobalTimeout().dividedBy(2).toNanos();
+    Duration chunkDeadline = Duration.ofNanos(Math.min(halfGlobalNanos, remainingNanos));
+
+    RetrySettings derivedChunkRetrySettings =
+        CHUNK_RETRY_SETTINGS.toBuilder()
+            .setTotalTimeoutDuration(chunkDeadline)
+            .setInitialRpcTimeoutDuration(chunkDeadline)
+            .setRpcTimeoutMultiplier(1.0)
+            .setMaxRpcTimeoutDuration(chunkDeadline)
+            .build();
+    ApiCallContext chunkCallContext = callContext.withRetrySettings(derivedChunkRetrySettings);
     ChunkAttemptCallable<ResponseT> attemptCallable =
         new ChunkAttemptCallable<>(
             uploadChunkCallable,
@@ -159,8 +180,10 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
             buffer,
             uploadUrl,
             chunkRequest,
-            callContext,
-            command);
+            chunkCallContext,
+            command,
+            deadlineNanos,
+            clientContext.getClock());
 
     RetryAlgorithm<ChunkUploadResponse<ResponseT>> retryAlgorithm =
         new RetryAlgorithm<>(
@@ -170,7 +193,7 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
         new ScheduledRetryingExecutor<>(retryAlgorithm, clientContext.getExecutor());
 
     RetryingFuture<ChunkUploadResponse<ResponseT>> retryingFuture =
-        retryingExecutor.createFuture(attemptCallable, callContext);
+        retryingExecutor.createFuture(attemptCallable, chunkCallContext);
     attemptCallable.setRetryingFuture(retryingFuture);
     this.currentChunkFuture = retryingFuture;
 

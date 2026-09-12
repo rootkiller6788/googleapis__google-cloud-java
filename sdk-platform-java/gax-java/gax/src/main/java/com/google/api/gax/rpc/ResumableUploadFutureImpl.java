@@ -45,9 +45,12 @@ import com.google.common.util.concurrent.MoreExecutors;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import java.io.IOException;
 import java.io.InputStream;
+import java.time.Duration;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import org.jspecify.annotations.NullMarked;
@@ -72,12 +75,17 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
   private final InputStream payload;
   private final ResumableUploadCallSettings settings;
   private final ClientContext clientContext;
+  private final ScheduledExecutorService executor;
   private final SettableApiFuture<ResponseT> resultFuture = SettableApiFuture.create();
 
   private volatile @Nullable String uploadSessionUrl;
+  private volatile long deadlineNanos;
 
   @GuardedBy("lock")
   private @Nullable ApiFuture<?> inFlightFuture;
+
+  @GuardedBy("lock")
+  private @Nullable ScheduledFuture<?> timeoutFuture;
 
   static <ResponseT> ResumableUploadFutureImpl<ResponseT> create(
       ApiFuture<ResumableUploadSession> startFuture,
@@ -118,10 +126,17 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
     this.settings = checkNotNull(settings, "settings must not be null");
     checkArgument(settings.getChunkSize() > 0, "chunkSize must be > 0");
     this.clientContext = checkNotNull(clientContext, "clientContext must not be null");
+    this.executor = checkNotNull(clientContext.getExecutor(), "executor must not be null");
     this.inFlightFuture = startFuture;
   }
 
   private void start() {
+    Duration timeout = settings.getGlobalTimeout();
+    this.deadlineNanos = clientContext.getClock().nanoTime() + timeout.toNanos();
+    synchronized (lock) {
+      this.timeoutFuture =
+          executor.schedule(this::onTimeout, timeout.toMillis(), TimeUnit.MILLISECONDS);
+    }
     ApiFutures.addCallback(
         startFuture,
         new ApiFutureCallback<ResumableUploadSession>() {
@@ -137,7 +152,8 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
                     queryStatusCallable,
                     uploadSessionUrl,
                     payload,
-                    settings.getChunkSize(),
+                    settings,
+                    deadlineNanos,
                     clientContext);
             ApiFuture<ResponseT> uploadFuture;
             try {
@@ -182,17 +198,44 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
         MoreExecutors.directExecutor());
   }
 
+  private void onTimeout() {
+    String message;
+    if (uploadSessionUrl != null) {
+      message = "Resumable upload timed out for session: " + uploadSessionUrl;
+    } else {
+      message = "Resumable upload timed out before session initiation completed";
+    }
+    fail(new DeadlineExceededException(message, null, TIMEOUT_STATUS_CODE, false));
+  }
+
   private void succeed(@Nullable ResponseT result) {
+    ScheduledFuture<?> timeout;
     synchronized (lock) {
       inFlightFuture = null;
+      timeout = this.timeoutFuture;
+      this.timeoutFuture = null;
+    }
+    if (timeout != null) {
+      timeout.cancel(false);
     }
     closePayload();
     resultFuture.set(result);
   }
 
   private void fail(Throwable t) {
+    ScheduledFuture<?> timeout;
+    ApiFuture<?> inFlight;
     synchronized (lock) {
-      inFlightFuture = null;
+      inFlight = this.inFlightFuture;
+      this.inFlightFuture = null;
+      timeout = this.timeoutFuture;
+      this.timeoutFuture = null;
+    }
+    if (timeout != null) {
+      timeout.cancel(false);
+    }
+    if (inFlight != null) {
+      inFlight.cancel(true);
     }
     closePayload();
     resultFuture.setException(t);
@@ -220,10 +263,16 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
   public boolean cancel(boolean mayInterruptIfRunning) {
     boolean cancelled;
     ApiFuture<?> inFlight;
+    ScheduledFuture<?> timeout;
     synchronized (lock) {
       cancelled = resultFuture.cancel(mayInterruptIfRunning);
       inFlight = this.inFlightFuture;
       this.inFlightFuture = null;
+      timeout = this.timeoutFuture;
+      this.timeoutFuture = null;
+    }
+    if (timeout != null) {
+      timeout.cancel(false);
     }
     if (inFlight != null) {
       inFlight.cancel(mayInterruptIfRunning);
@@ -252,4 +301,17 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
       throws InterruptedException, ExecutionException, TimeoutException {
     return resultFuture.get(timeout, unit);
   }
+
+  private static final StatusCode TIMEOUT_STATUS_CODE =
+      new StatusCode() {
+        @Override
+        public StatusCode.Code getCode() {
+          return StatusCode.Code.DEADLINE_EXCEEDED;
+        }
+
+        @Override
+        public @Nullable Object getTransportCode() {
+          return null;
+        }
+      };
 }
