@@ -43,12 +43,10 @@ import com.google.api.gax.retrying.ExponentialRetryAlgorithm;
 import com.google.api.gax.retrying.RetryAlgorithm;
 import com.google.api.gax.retrying.RetrySettings;
 import com.google.api.gax.retrying.ScheduledRetryingExecutor;
-import com.google.common.io.ByteStreams;
 import com.google.common.util.concurrent.MoreExecutors;
 import java.io.IOException;
 import java.io.InputStream;
 import java.time.Duration;
-import java.util.Arrays;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.Executor;
 import org.jspecify.annotations.NullMarked;
@@ -71,17 +69,13 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
           .setMaxAttempts(5)
           .build();
 
-  private static final byte[] EMPTY_PAYLOAD = new byte[0];
-
   private final Executor chunkExecutor =
       MoreExecutors.newSequentialExecutor(MoreExecutors.directExecutor());
 
   private final UnaryCallable<ChunkUploadRequest, ChunkUploadResponse<ResponseT>>
       uploadChunkCallable;
   private final String uploadUrl;
-  private final InputStream payload;
-  private final byte[] buffer;
-  private final int chunkSize;
+  private final RewindableStreamBuffer buffer;
   private final ApiCallContext callContext;
   private final SettableApiFuture<ResponseT> result = SettableApiFuture.create();
   private volatile @Nullable ApiFuture<?> currentChunkFuture;
@@ -94,11 +88,10 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
       ClientContext clientContext) {
     checkNotNull(uploadChunkCallable, "uploadChunkCallable must not be null");
     this.uploadUrl = checkNotNull(uploadUrl, "uploadUrl must not be null");
-    this.payload = checkNotNull(payload, "payload must not be null");
-    this.chunkSize = chunkSize;
+    checkNotNull(payload, "payload must not be null");
     checkNotNull(clientContext, "clientContext must not be null");
     this.callContext = clientContext.getDefaultCallContext();
-    this.buffer = new byte[chunkSize];
+    this.buffer = new RewindableStreamBuffer(payload, chunkSize, uploadUrl);
 
     RetryAlgorithm<ChunkUploadResponse<ResponseT>> retryAlgorithm =
         new RetryAlgorithm<>(
@@ -131,35 +124,26 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
     }
 
     // Read the next chunk slice from the payload stream.
-    int bytesRead;
     try {
-      bytesRead = ByteStreams.read(payload, buffer, 0, chunkSize);
+      buffer.fill(currentOffset);
     } catch (IOException e) {
       result.setException(e);
       return;
     }
 
     // Determine if this is the final chunk and build the chunk request.
-    boolean isFinal = bytesRead < chunkSize;
-    byte[] chunkPayload;
-    if (bytesRead == chunkSize) {
-      chunkPayload = buffer;
-    } else if (bytesRead == 0) {
-      chunkPayload = EMPTY_PAYLOAD;
-    } else {
-      chunkPayload = Arrays.copyOf(buffer, bytesRead);
-    }
-
     ChunkUploadRequest chunkRequest =
         ChunkUploadRequest.newBuilder()
             .setUploadUrl(uploadUrl)
-            .setPayload(chunkPayload)
-            .setOffset(currentOffset)
-            .setFinal(isFinal)
+            .setPayload(buffer.getBuffer())
+            .setPayloadLength(buffer.getPayloadLength())
+            .setOffset(buffer.getBufferBaseOffset())
+            .setFinal(buffer.isFinal())
             .build();
 
     // Dispatch the chunk upload call and register the in-flight future for cancellation.
-    long chunkLength = chunkPayload.length;
+    long chunkLength = chunkRequest.getPayloadLength();
+    boolean isFinal = chunkRequest.isFinal();
     try {
       ApiFuture<ChunkUploadResponse<ResponseT>> chunkFuture =
           uploadChunkCallable.futureCall(chunkRequest, callContext);

@@ -30,6 +30,7 @@
 package com.google.api.gax.resumable;
 
 import static com.google.common.truth.Truth.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.nio.charset.StandardCharsets;
 import org.junit.jupiter.api.Test;
@@ -62,5 +63,56 @@ class ChunkUploadRequestTest {
 
     assertThat(request.isFinal()).isTrue();
     assertThat(request.getPayload()).isEmpty();
+  }
+
+  @Test
+  void builder_defaultsPayloadLengthToArrayLength() {
+    byte[] payload = "test-payload".getBytes(StandardCharsets.UTF_8);
+    ChunkUploadRequest request =
+        ChunkUploadRequest.newBuilder()
+            .setUploadUrl("https://upload.example.com/session/1")
+            .setPayload(payload)
+            .setOffset(0L)
+            .build();
+
+    assertThat(request.getPayloadLength()).isEqualTo(payload.length);
+  }
+
+  @Test
+  void builder_customPayloadLength_preservesValue() {
+    byte[] payload = new byte[1024];
+    ChunkUploadRequest request =
+        ChunkUploadRequest.newBuilder()
+            .setUploadUrl("https://upload.example.com/session/1")
+            .setPayload(payload)
+            .setPayloadLength(500)
+            .setOffset(2048L)
+            .build();
+
+    assertThat(request.getPayloadLength()).isEqualTo(500);
+  }
+
+  @Test
+  void builder_invalidBounds_throwsIllegalArgumentException() {
+    byte[] payload = new byte[100];
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            ChunkUploadRequest.newBuilder()
+                .setUploadUrl("https://upload.example.com/session/1")
+                .setPayload(payload)
+                .setOffset(0L)
+                .setPayloadLength(-1)
+                .build());
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            ChunkUploadRequest.newBuilder()
+                .setUploadUrl("https://upload.example.com/session/1")
+                .setPayload(payload)
+                .setOffset(0L)
+                .setPayloadLength(150)
+                .build());
   }
 }

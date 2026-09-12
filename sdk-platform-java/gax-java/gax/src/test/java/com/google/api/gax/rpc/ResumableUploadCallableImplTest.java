@@ -52,6 +52,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CountDownLatch;
@@ -426,9 +427,11 @@ class ResumableUploadCallableImplTest {
     verify(mockChunkCallable, times(2)).futureCall(captor.capture(), any());
     List<ChunkUploadRequest> requests = captor.getAllValues();
     assertThat(requests.get(0).getOffset()).isEqualTo(0);
-    assertThat(requests.get(0).getPayload()).isEqualTo("01234567".getBytes(StandardCharsets.UTF_8));
+    assertThat(Arrays.copyOf(requests.get(0).getPayload(), requests.get(0).getPayloadLength()))
+        .isEqualTo("01234567".getBytes(StandardCharsets.UTF_8));
     assertThat(requests.get(1).getOffset()).isEqualTo(0);
-    assertThat(requests.get(1).getPayload()).isEqualTo("01234567".getBytes(StandardCharsets.UTF_8));
+    assertThat(Arrays.copyOf(requests.get(1).getPayload(), requests.get(1).getPayloadLength()))
+        .isEqualTo("01234567".getBytes(StandardCharsets.UTF_8));
   }
 
   @Test
@@ -527,7 +530,7 @@ class ResumableUploadCallableImplTest {
   private static void assertChunk(
       ChunkUploadRequest chunk, long expectedOffset, int expectedSize, boolean expectedFinal) {
     assertThat(chunk.getOffset()).isEqualTo(expectedOffset);
-    assertThat(chunk.getPayload().length).isEqualTo(expectedSize);
+    assertThat(chunk.getPayloadLength()).isEqualTo(expectedSize);
     assertThat(chunk.isFinal()).isEqualTo(expectedFinal);
   }
 
