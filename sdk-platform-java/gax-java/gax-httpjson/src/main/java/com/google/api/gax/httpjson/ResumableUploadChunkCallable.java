@@ -33,6 +33,7 @@ import com.google.api.client.http.HttpMethods;
 import com.google.api.core.ApiFuture;
 import com.google.api.gax.resumable.ChunkUploadRequest;
 import com.google.api.gax.resumable.ChunkUploadResponse;
+import com.google.api.gax.resumable.ResumableUploadStatus;
 import com.google.api.gax.rpc.ApiCallContext;
 import com.google.api.gax.rpc.ApiExceptionFactory;
 import com.google.api.gax.rpc.ClientContext;
@@ -59,7 +60,6 @@ class ResumableUploadChunkCallable<ResponseT>
   private static final String UPLOAD_COMMAND_HEADER = "X-Goog-Upload-Command";
   private static final String UPLOAD_OFFSET_HEADER = "X-Goog-Upload-Offset";
   private static final String UPLOAD_STATUS_HEADER = "X-Goog-Upload-Status";
-  private static final String STATUS_FINAL = "final";
 
   private static final String COMMAND_UPLOAD = "upload";
   private static final String COMMAND_FINALIZE = "finalize";
@@ -165,7 +165,7 @@ class ResumableUploadChunkCallable<ResponseT>
 
     private final ResumableUploadHttpJsonFuture<ChunkUploadResponse<ResponseT>> future;
     private final HttpResponseParser<ResponseT> responseParser;
-    @Nullable private String uploadStatus = null;
+    private ResumableUploadStatus uploadStatus = ResumableUploadStatus.UNKNOWN;
     private String responseBody = "";
 
     private ChunkUploadResponseListener(
@@ -178,7 +178,9 @@ class ResumableUploadChunkCallable<ResponseT>
     @Override
     public void onHeaders(HttpJsonMetadata responseHeaders) {
       Map<String, Object> headers = responseHeaders.getHeaders();
-      this.uploadStatus = HttpHeadersUtils.getSingleHeader(headers, UPLOAD_STATUS_HEADER);
+      this.uploadStatus =
+          ResumableUploadStatus.fromHeader(
+              HttpHeadersUtils.getSingleHeader(headers, UPLOAD_STATUS_HEADER));
     }
 
     @Override
@@ -191,27 +193,19 @@ class ResumableUploadChunkCallable<ResponseT>
     @Override
     public void onClose(int statusCode, HttpJsonMetadata trailers) {
       try {
-        if (statusCode >= 200 && statusCode < 300) {
-          if (uploadStatus == null) {
-            future.setException(
-                ApiExceptionFactory.createException(
-                    "Upload chunk response did not contain valid "
-                        + UPLOAD_STATUS_HEADER
-                        + " header",
-                    /* cause= */ null,
-                    HttpJsonStatusCode.of(StatusCode.Code.INTERNAL),
-                    /* retryable= */ false));
-            return;
-          }
-          boolean isComplete = STATUS_FINAL.equalsIgnoreCase(uploadStatus);
-          ChunkUploadResponse.Builder<ResponseT> chunkResponseBuilder =
-              ChunkUploadResponse.<ResponseT>newBuilder().setComplete(isComplete);
-          if (isComplete) {
+        if (statusCode >= 200
+            && statusCode < 300
+            && uploadStatus != ResumableUploadStatus.CANCELLED) {
+          ResponseT response = null;
+          if (uploadStatus == ResumableUploadStatus.FINAL) {
             InputStream stream =
                 new ByteArrayInputStream(responseBody.getBytes(StandardCharsets.UTF_8));
-            chunkResponseBuilder.setResponse(responseParser.parse(stream));
+            response = responseParser.parse(stream);
           }
-          future.set(chunkResponseBuilder.build());
+          future.set(ChunkUploadResponse.create(uploadStatus, response));
+        } else if (uploadStatus == ResumableUploadStatus.CANCELLED
+            || uploadStatus == ResumableUploadStatus.FINAL) {
+          future.setException(createServerRejectionException(statusCode, uploadStatus, trailers));
         } else {
           Throwable cause = trailers.getException();
           future.setException(
@@ -224,5 +218,29 @@ class ResumableUploadChunkCallable<ResponseT>
         future.setException(t);
       }
     }
+  }
+
+  private static final StatusCode FAILED_PRECONDITION_STATUS_CODE =
+      new StatusCode() {
+        @Override
+        public Code getCode() {
+          return Code.FAILED_PRECONDITION;
+        }
+
+        @Override
+        public @Nullable Integer getTransportCode() {
+          return null;
+        }
+      };
+
+  static Throwable createServerRejectionException(
+      int statusCode, ResumableUploadStatus uploadStatus, HttpJsonMetadata trailers) {
+    Throwable cause = trailers.getException();
+    String message = "Upload " + uploadStatus + " by server with status code: " + statusCode;
+    if (cause != null && cause.getMessage() != null) {
+      message = cause.getMessage();
+    }
+    return ApiExceptionFactory.createException(
+        message, cause, FAILED_PRECONDITION_STATUS_CODE, /* retryable= */ false);
   }
 }
