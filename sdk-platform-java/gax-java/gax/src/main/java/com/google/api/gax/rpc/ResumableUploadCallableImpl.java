@@ -61,6 +61,17 @@ import org.jspecify.annotations.Nullable;
 public class ResumableUploadCallableImpl<RequestT, ResponseT>
     extends ResumableUploadCallable<RequestT, ResponseT> {
 
+  static final RetrySettings DEFAULT_START_RETRY_SETTINGS =
+      RetrySettings.newBuilder()
+          .setInitialRetryDelayDuration(Duration.ofMillis(100))
+          .setRetryDelayMultiplier(1.3)
+          .setMaxRetryDelayDuration(Duration.ofMinutes(1))
+          .setInitialRpcTimeoutDuration(Duration.ofSeconds(30))
+          .setRpcTimeoutMultiplier(1.0)
+          .setMaxRpcTimeoutDuration(Duration.ofSeconds(30))
+          .setTotalTimeoutDuration(Duration.ofMinutes(5))
+          .build();
+
   static final RetrySettings DEFAULT_QUERY_RETRY_SETTINGS =
       RetrySettings.newBuilder()
           .setInitialRetryDelayDuration(Duration.ofMillis(100))
@@ -75,6 +86,7 @@ public class ResumableUploadCallableImpl<RequestT, ResponseT>
   private final ResumableUploadClient<RequestT, ResponseT> client;
   private final ResumableUploadCallSettings defaultCallSettings;
   private final ClientContext clientContext;
+  private final UnaryCallable<RequestT, ResumableUploadSession> retryingStartCallable;
   private final UnaryCallable<QueryStatusRequest, QueryStatusResponse<ResponseT>>
       retryingQueryCallable;
 
@@ -86,6 +98,17 @@ public class ResumableUploadCallableImpl<RequestT, ResponseT>
     this.defaultCallSettings =
         checkNotNull(defaultCallSettings, "defaultCallSettings must not be null");
     this.clientContext = checkNotNull(clientContext, "clientContext must not be null");
+
+    RetryAlgorithm<ResumableUploadSession> retryAlgorithm =
+        new RetryAlgorithm<>(
+            new ResumableUploadResultRetryAlgorithm<>(ResumableUploadCommand.START),
+            new ExponentialRetryAlgorithm(DEFAULT_START_RETRY_SETTINGS, clientContext.getClock()));
+
+    this.retryingStartCallable =
+        new RetryingCallable<>(
+            clientContext.getDefaultCallContext(),
+            client.startUploadCallable(),
+            new ScheduledRetryingExecutor<>(retryAlgorithm, clientContext.getExecutor()));
 
     RetryAlgorithm<QueryStatusResponse<ResponseT>> queryRetryAlgorithm =
         new RetryAlgorithm<>(
@@ -99,6 +122,13 @@ public class ResumableUploadCallableImpl<RequestT, ResponseT>
             new ScheduledRetryingExecutor<>(queryRetryAlgorithm, clientContext.getExecutor()));
   }
 
+  /**
+   * {@inheritDoc}
+   *
+   * <p>Call context overrides configured via {@link
+   * ApiCallContext#withRetrySettings(RetrySettings)} govern timing and backoff for the session
+   * initiation request, while error classification is fixed by the upload protocol.
+   */
   @Override
   public ResumableUploadFuture<ResponseT> futureCall(
       RequestT request,
@@ -112,7 +142,7 @@ public class ResumableUploadCallableImpl<RequestT, ResponseT>
 
     ApiFuture<ResumableUploadSession> startFuture;
     try {
-      startFuture = client.startUploadCallable().futureCall(request, effectiveCallContext);
+      startFuture = retryingStartCallable.futureCall(request, effectiveCallContext);
     } catch (Throwable t) {
       startFuture = ApiFutures.immediateFailedFuture(t);
     }
