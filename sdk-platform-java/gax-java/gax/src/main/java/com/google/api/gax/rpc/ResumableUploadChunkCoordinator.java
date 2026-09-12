@@ -87,6 +87,7 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
   private final long deadlineNanos;
   private final ApiCallContext callContext;
   private final ClientContext clientContext;
+  private final UploadProgressTracker progressTracker;
   private final SettableApiFuture<ResponseT> result = SettableApiFuture.create();
   private volatile @Nullable ApiFuture<?> currentChunkFuture;
 
@@ -97,7 +98,8 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
       InputStream payload,
       ResumableUploadCallSettings settings,
       long deadlineNanos,
-      ClientContext clientContext) {
+      ClientContext clientContext,
+      UploadProgressTracker progressTracker) {
     this.uploadChunkCallable =
         checkNotNull(uploadChunkCallable, "uploadChunkCallable must not be null");
     this.queryStatusCallable =
@@ -108,6 +110,7 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
     this.deadlineNanos = deadlineNanos;
     this.clientContext = checkNotNull(clientContext, "clientContext must not be null");
     this.callContext = clientContext.getDefaultCallContext();
+    this.progressTracker = checkNotNull(progressTracker, "progressTracker must not be null");
     this.buffer = new RewindableStreamBuffer(payload, settings.getChunkSize(), uploadUrl);
   }
 
@@ -182,6 +185,7 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
             chunkRequest,
             chunkCallContext,
             command,
+            progressTracker,
             deadlineNanos,
             clientContext.getClock());
 
@@ -206,6 +210,7 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
               return;
             }
             long nextOffset = buffer.getBufferBaseOffset() + buffer.getPayloadLength();
+            progressTracker.onChunkUploaded(nextOffset);
             if (response.getUploadStatus() == ResumableUploadStatus.FINAL) {
               result.set(response.getResponse());
             } else if (buffer.isFinal()) {
