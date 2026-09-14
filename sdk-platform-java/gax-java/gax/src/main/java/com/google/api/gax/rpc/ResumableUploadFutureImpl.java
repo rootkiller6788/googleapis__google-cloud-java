@@ -128,16 +128,40 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
             ResumableUploadChunkCoordinator<ResponseT> coordinator =
                 new ResumableUploadChunkCoordinator<>(
                     uploadChunkCallable,
-                    session.getUploadUrl(),
+                    uploadSessionUrl,
                     payload,
                     settings.getChunkSize(),
-                    callContext,
-                    ResumableUploadFutureImpl.this);
+                    callContext);
+            ApiFuture<ResponseT> uploadFuture;
             try {
-              coordinator.start();
+              uploadFuture = coordinator.start();
             } catch (Throwable t) {
               fail(t);
+              return;
             }
+            synchronized (lock) {
+              if (resultFuture.isDone()) {
+                return;
+              }
+              inFlightFuture = uploadFuture;
+            }
+            ApiFutures.addCallback(
+                uploadFuture,
+                new ApiFutureCallback<ResponseT>() {
+                  @Override
+                  public void onSuccess(ResponseT response) {
+                    succeed(response);
+                  }
+
+                  @Override
+                  public void onFailure(Throwable t) {
+                    if (t instanceof CancellationException) {
+                      return;
+                    }
+                    fail(t);
+                  }
+                },
+                MoreExecutors.directExecutor());
           }
 
           @Override
@@ -151,25 +175,7 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
         MoreExecutors.directExecutor());
   }
 
-  /**
-   * Registers the active in-flight future for cancellation. If this session future has already been
-   * canceled, the supplied future is canceled immediately.
-   */
-  void setInFlightFuture(ApiFuture<?> inFlightFuture) {
-    boolean shouldCancel = false;
-    synchronized (lock) {
-      if (resultFuture.isDone()) {
-        shouldCancel = resultFuture.isCancelled();
-      } else {
-        this.inFlightFuture = inFlightFuture;
-      }
-    }
-    if (shouldCancel) {
-      inFlightFuture.cancel(true);
-    }
-  }
-
-  void succeed(@Nullable ResponseT result) {
+  private void succeed(@Nullable ResponseT result) {
     synchronized (lock) {
       inFlightFuture = null;
     }
@@ -177,7 +183,7 @@ final class ResumableUploadFutureImpl<ResponseT> implements ResumableUploadFutur
     resultFuture.set(result);
   }
 
-  void fail(Throwable t) {
+  private void fail(Throwable t) {
     synchronized (lock) {
       inFlightFuture = null;
     }
