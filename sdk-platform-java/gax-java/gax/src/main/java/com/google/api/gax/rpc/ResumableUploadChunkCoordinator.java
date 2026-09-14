@@ -35,6 +35,7 @@ import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
 import com.google.api.core.InternalApi;
+import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.resumable.ChunkUploadRequest;
 import com.google.api.gax.resumable.ChunkUploadResponse;
 import com.google.api.gax.resumable.ResumableUploadStatus;
@@ -45,6 +46,7 @@ import java.io.InputStream;
 import java.util.Arrays;
 import java.util.concurrent.CancellationException;
 import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Coordinates chunk transmission steps of a resumable upload session.
@@ -64,32 +66,40 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
   private final byte[] buffer;
   private final int chunkSize;
   private final ApiCallContext callContext;
-  private final ResumableUploadFutureImpl<ResponseT> sessionFuture;
+  private final SettableApiFuture<ResponseT> result = SettableApiFuture.create();
+  private volatile @Nullable ApiFuture<?> currentChunkFuture;
 
   ResumableUploadChunkCoordinator(
       UnaryCallable<ChunkUploadRequest, ChunkUploadResponse<ResponseT>> uploadChunkCallable,
       String uploadUrl,
       InputStream payload,
       int chunkSize,
-      ApiCallContext callContext,
-      ResumableUploadFutureImpl<ResponseT> sessionFuture) {
+      ApiCallContext callContext) {
     this.uploadChunkCallable =
         checkNotNull(uploadChunkCallable, "uploadChunkCallable must not be null");
     this.uploadUrl = checkNotNull(uploadUrl, "uploadUrl must not be null");
     this.payload = checkNotNull(payload, "payload must not be null");
     this.chunkSize = chunkSize;
     this.callContext = checkNotNull(callContext, "callContext must not be null");
-    this.sessionFuture = checkNotNull(sessionFuture, "sessionFuture must not be null");
     this.buffer = new byte[chunkSize];
   }
 
-  void start() {
+  ApiFuture<ResponseT> start() {
+    result.addListener(
+            () -> {
+              ApiFuture<?> chunk = currentChunkFuture;
+              if (result.isCancelled() && chunk != null) {
+                chunk.cancel(true);
+              }
+            },
+            MoreExecutors.directExecutor());
     transmitChunk(0L);
+    return result;
   }
 
   private void transmitChunk(long currentOffset) {
     // Abort if the session was already completed or canceled.
-    if (sessionFuture.isDone()) {
+    if (result.isDone()) {
       return;
     }
 
@@ -98,7 +108,7 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
     try {
       bytesRead = ByteStreams.read(payload, buffer, 0, chunkSize);
     } catch (IOException e) {
-      sessionFuture.fail(e);
+      result.setException(e);
       return;
     }
 
@@ -126,22 +136,21 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
     try {
       ApiFuture<ChunkUploadResponse<ResponseT>> chunkFuture =
           uploadChunkCallable.futureCall(chunkRequest, callContext);
-      sessionFuture.setInFlightFuture(chunkFuture);
+      this.currentChunkFuture = chunkFuture;
 
-      // Asynchronously handle the response: complete, fail, or chain the next chunk.
       ApiFutures.addCallback(
           chunkFuture,
           new ApiFutureCallback<ChunkUploadResponse<ResponseT>>() {
             @Override
             public void onSuccess(ChunkUploadResponse<ResponseT> response) {
-              if (sessionFuture.isDone()) {
+              if (result.isDone()) {
                 return;
               }
               long nextOffset = currentOffset + chunkLength;
               if (response.getUploadStatus() == ResumableUploadStatus.FINAL) {
-                sessionFuture.succeed(response.getResponse());
+                result.set(response.getResponse());
               } else if (isFinal) {
-                sessionFuture.fail(
+                result.setException(
                     new IllegalStateException(
                         "Upload stream ended and final chunk was transmitted, but server returned"
                             + " incomplete status"));
@@ -152,15 +161,15 @@ final class ResumableUploadChunkCoordinator<ResponseT> {
 
             @Override
             public void onFailure(Throwable t) {
-              if (t instanceof CancellationException || sessionFuture.isDone()) {
+              if (t instanceof CancellationException || result.isDone()) {
                 return;
               }
-              sessionFuture.fail(t);
+              result.setException(t);
             }
           },
           MoreExecutors.directExecutor());
     } catch (Throwable t) {
-      sessionFuture.fail(t);
+      result.setException(t);
     }
   }
 }

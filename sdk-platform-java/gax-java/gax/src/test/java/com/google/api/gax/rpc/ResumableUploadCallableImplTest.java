@@ -230,20 +230,6 @@ class ResumableUploadCallableImplTest {
   }
 
   @Test
-  void testUploadCallable_setInFlightFutureAfterCancel_immediatelyCancelsFuture() {
-    SettableApiFuture<ResumableUploadSession> startFuture = SettableApiFuture.create();
-    when(mockStartCallable.futureCall(any(), any())).thenReturn(startFuture);
-    ResumableUploadFuture<String> future =
-        callable.futureCall("resource-path", streamOf("data"), null);
-    assertThat(future.cancel(true)).isTrue();
-    assertThat(future.isCancelled()).isTrue();
-
-    SettableApiFuture<String> lateFuture = SettableApiFuture.create();
-    ((ResumableUploadFutureImpl<String>) future).setInFlightFuture(lateFuture);
-    assertThat(lateFuture.isCancelled()).isTrue();
-  }
-
-  @Test
   void testUploadCallable_startFailure_failsFuture() {
     when(mockStartCallable.futureCall(any(), any()))
         .thenReturn(ApiFutures.immediateFailedFuture(new IllegalStateException("start failed")));
